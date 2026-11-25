@@ -1,8 +1,9 @@
 """@skracajbot - streszcza głosówki w grupie.
 
-Użycie:
-- każda głosówka od MIN_DURATION_SECONDS sekund w górę dostaje streszczenie automatycznie,
-- /skracaj (odpowiedź na głosówkę): streszczenie, a dla krótkiej głosówki sam tekst,
+Bot reaguje tylko na komendy (najlepiej z privacy mode włączonym w @BotFather,
+wtedy Telegram w ogóle nie wysyła mu zwykłych wiadomości z grupy):
+- /skracaj (odpowiedź na głosówkę): streszczenie, a dla głosówki krótszej niż
+  MIN_DURATION_SECONDS sam tekst,
 - /tekst (odpowiedź na głosówkę): pełna transkrypcja,
 - /usun (odpowiedź na wiadomość bota): bot usuwa tę swoją wiadomość.
 Przepływ: pobranie pliku -> transkrypcja (Groq Whisper)
@@ -23,8 +24,6 @@ from telegram.ext import (
     ChatMemberHandler,
     CommandHandler,
     ContextTypes,
-    MessageHandler,
-    filters,
 )
 
 load_dotenv()
@@ -38,7 +37,7 @@ if _missing:
 
 TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
 DEEPSEEK_MODEL = os.getenv("DEEPSEEK_MODEL", "deepseek-chat")
-# Krótsze głosówki tylko przepisujemy na tekst, bez streszczania.
+# Krótsze głosówki /skracaj tylko przepisuje na tekst, bez streszczania.
 MIN_DURATION = int(os.getenv("MIN_DURATION_SECONDS", "9"))
 # ID czatów, w których bot działa (oddzielone przecinkami). Puste = działa wszędzie.
 ALLOWED_CHAT_IDS = {int(x) for x in os.getenv("ALLOWED_CHAT_IDS", "").replace(" ", "").split(",") if x}
@@ -46,6 +45,7 @@ TG_LIMIT = 4000  # Telegram przyjmuje do 4096 znaków w jednej wiadomości
 
 logging.basicConfig(format="%(asctime)s %(levelname)s %(message)s", level=logging.INFO)
 logging.getLogger("httpx").setLevel(logging.WARNING)
+# Logi bez treści, imion i ID czatów: tylko co się stało i ewentualny typ błędu.
 log = logging.getLogger("skracajbot")
 
 groq = AsyncGroq()  # czyta GROQ_API_KEY z .env
@@ -63,10 +63,10 @@ STYLE = """JAK PISAĆ (najważniejsze):
 - jak ktoś pisze z błędami albo slangiem, możesz pisać podobnie"""
 
 SYSTEM_PROMPT = """Ktoś z grupy znajomych wrzucił głosówkę, a ty streszczasz ją reszcie, jak kumpel, który przesłuchał za nich.
-Dostajesz imię autora i transkrypcję (może mieć błędy rozpoznawania mowy, domyśl się o co chodzi).
+Dostajesz samą transkrypcję (może mieć błędy rozpoznawania mowy, domyśl się o co chodzi).
 - 1-2 krótkie zdania, a jak jest kilka spraw, to parę krótkich punktów
 - same konkrety: o co pyta, co proponuje, kiedy, gdzie, kto ma co zrobić
-- mów o autorze po imieniu (np. "kuba pyta czy..."), nie dodawaj swoich ocen
+- imię autora bot dopisze sam, więc pisz bez podmiotu (np. "pyta czy ktoś jedzie w sobotę"), nie dodawaj swoich ocen
 """ + STYLE
 
 def is_allowed(chat_id: int) -> bool:
@@ -74,7 +74,7 @@ def is_allowed(chat_id: int) -> bool:
 
 
 # ---------------------------------------------------------------- transkrypcja i streszczenia
-# Ostatnie transkrypcje (file_unique_id -> tekst), żeby /tekst po auto-streszczeniu nie płacił drugi raz.
+# Ostatnie transkrypcje w RAM (file_unique_id -> tekst), żeby /tekst po /skracaj nie płacił drugi raz.
 transcripts: OrderedDict[str, str] = OrderedDict()
 
 
@@ -101,8 +101,8 @@ async def ask_deepseek(system: str, content: str, temperature: float = 1.0) -> s
     return text or None
 
 
-async def summarize(transcript: str, sender: str) -> str | None:
-    return await ask_deepseek(SYSTEM_PROMPT, f"Autor: {sender}\n<transkrypcja>\n{transcript}\n</transkrypcja>")
+async def summarize(transcript: str) -> str | None:
+    return await ask_deepseek(SYSTEM_PROMPT, f"<transkrypcja>\n{transcript}\n</transkrypcja>")
 
 
 def voice_media(msg):
@@ -146,40 +146,36 @@ async def reply_long(msg, text: str) -> None:
         msg = await msg.reply_text(part)
 
 
-async def process_voice(context: ContextTypes.DEFAULT_TYPE, target, errors_to, auto: bool) -> None:
+async def process_voice(context: ContextTypes.DEFAULT_TYPE, target, errors_to) -> None:
     """Transkrypcja + streszczenie głosówki `target`. Błędy idą jako odpowiedź na `errors_to`."""
     media, _ = voice_media(target)
-    # Krótkie głosówki: automatycznie pomijamy, a na /skracaj tylko przepisujemy (bez DeepSeeka).
+    # Krótkie głosówki tylko przepisujemy (bez DeepSeeka).
     short = (media.duration or 0) < MIN_DURATION
-    if auto and short:
-        return
 
     sender = sender_name(target)
-    log.info("%s: głosówka od %s (%ss) w czacie %s", "auto" if auto else "/skracaj", sender, media.duration, target.chat_id)
+    log.info("/skracaj")
     await context.bot.send_chat_action(target.chat_id, ChatAction.TYPING)
 
     try:
         transcript = await get_transcript(context, target)
         if not transcript:
-            if not auto:
-                await target.reply_text("nic tu nie słychać 🤷")
+            await target.reply_text("nic tu nie słychać 🤷")
             return
         if short:
             await reply_long(target, f"🎙️ {sender}:\n\n{transcript}")
             return
-        summary = await summarize(transcript, sender)
-    except openai.APIError:
-        log.exception("Błąd API DeepSeek")
+        summary = await summarize(transcript)
+    except openai.APIError as e:
+        log.error("Błąd API DeepSeek: %s", type(e).__name__)
         await errors_to.reply_text("coś mi się wywaliło, spróbuj za chwilę 😵")
         return
-    except Exception:
-        log.exception("Błąd przetwarzania głosówki")
+    except Exception as e:
+        log.error("Błąd przetwarzania głosówki: %s", type(e).__name__)
         await errors_to.reply_text("nie dałem rady z tą głosówką 😵")
         return
 
     if summary is None:
-        if not auto:
-            await errors_to.reply_text("tego nie streszczę, sorry")
+        await errors_to.reply_text("tego nie streszczę, sorry")
         return
 
     minutes, seconds = divmod(media.duration or 0, 60)
@@ -198,14 +194,6 @@ def voice_target(message):
 
 
 # ---------------------------------------------------------------- handlery
-async def auto_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Każda głosówka od MIN_DURATION_SECONDS w górę -> streszczenie bez pytania."""
-    message = update.effective_message
-    if not is_allowed(message.chat_id):
-        return
-    await process_voice(context, message, message, auto=True)
-
-
 async def skracaj(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """/skracaj jako odpowiedź na głosówkę -> streszczenie (krótkie: sama transkrypcja)."""
     message = update.effective_message
@@ -215,7 +203,7 @@ async def skracaj(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if problem:
         await message.reply_text(problem)
         return
-    await process_voice(context, target, message, auto=False)
+    await process_voice(context, target, message)
 
 
 async def tekst(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -228,12 +216,12 @@ async def tekst(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await message.reply_text(problem)
         return
     sender = sender_name(target)
-    log.info("/tekst: głosówka od %s w czacie %s", sender, message.chat_id)
+    log.info("/tekst")
     await context.bot.send_chat_action(message.chat_id, ChatAction.TYPING)
     try:
         transcript = await get_transcript(context, target)
-    except Exception:
-        log.exception("Błąd transkrypcji")
+    except Exception as e:
+        log.error("Błąd transkrypcji: %s", type(e).__name__)
         await message.reply_text("nie dałem rady tego przepisać 😵")
         return
     if not transcript:
@@ -256,11 +244,11 @@ async def usun(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
     try:
         await target.delete()
-    except Exception:
-        log.exception("Nie udało się usunąć wiadomości %s", target.message_id)
+    except Exception as e:
+        log.error("Nie udało się usunąć wiadomości: %s", type(e).__name__)
         await message.reply_text("nie mogę, telegram pozwala kasować tylko do 48h")
         return
-    log.info("/usun: usunięto wiadomość %s w czacie %s", target.message_id, message.chat_id)
+    log.info("/usun")
     try:
         await message.delete()  # samą komendę też, jeśli bot jest adminem; jeśli nie, zostaje
     except Exception:
@@ -271,7 +259,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_allowed(update.effective_chat.id):
         return
     await update.effective_message.reply_text(
-        "siema 👋 dłuższe głosówki streszczam sam, a poza tym:\n"
+        "siema 👋 odpowiedz na głosówkę jedną z komend:\n"
         "/skracaj na głosówce: streszczenie\n"
         "/tekst na głosówce: cały tekst\n"
         "/usun na mojej wiadomości: kasuję ją"
@@ -281,7 +269,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def show_id(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """/id - pokazuje ID czatu, żeby wpisać je do ALLOWED_CHAT_IDS."""
     chat = update.effective_chat
-    log.info("ID czatu '%s': %s", chat.title or chat.full_name, chat.id)
     await update.effective_message.reply_text(f"id tego czatu: {chat.id}")
 
 
@@ -291,7 +278,7 @@ async def on_added(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     chat = member.chat
     joined = member.new_chat_member.status in ("member", "administrator")
     if joined and chat.type != "private" and not is_allowed(chat.id):
-        log.warning("Dodano mnie do obcej grupy '%s' (%s) - wychodzę", chat.title, chat.id)
+        log.warning("Dodano mnie do obcej grupy - wychodzę")
         await context.bot.leave_chat(chat.id)
 
 
@@ -305,6 +292,11 @@ async def post_init(app: Application) -> None:
     ])
 
 
+async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    # Bez tego python-telegram-bot wypisuje do logów całą wiadomość, przy której był błąd.
+    log.error("Błąd: %s", type(context.error).__name__)
+
+
 def main() -> None:
     app = Application.builder().token(TELEGRAM_TOKEN).post_init(post_init).build()
     app.add_handler(CommandHandler("start", start))
@@ -312,10 +304,10 @@ def main() -> None:
     app.add_handler(CommandHandler("tekst", tekst))
     app.add_handler(CommandHandler("usun", usun))
     app.add_handler(CommandHandler("id", show_id))
-    app.add_handler(MessageHandler(filters.UpdateType.MESSAGE & (filters.VOICE | filters.AUDIO | filters.VIDEO_NOTE), auto_voice))
     app.add_handler(ChatMemberHandler(on_added, ChatMemberHandler.MY_CHAT_MEMBER))
+    app.add_error_handler(on_error)
     if ALLOWED_CHAT_IDS:
-        log.info("Działam tylko w czatach: %s", ", ".join(map(str, ALLOWED_CHAT_IDS)))
+        log.info("Działam tylko w dozwolonych czatach (%d)", len(ALLOWED_CHAT_IDS))
     else:
         log.warning("ALLOWED_CHAT_IDS jest puste - bot działa w KAŻDYM czacie. Napisz /id w swojej grupie.")
     log.info("@skracajbot działa. Ctrl+C żeby zatrzymać.")
