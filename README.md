@@ -4,7 +4,6 @@ Bot do grupy na Telegramie: na komendę streszcza głosówkę krótko, luźnym j
 
 - `/skracaj` jako odpowiedź na głosówkę: streszczenie. Dla głosówki krótszej niż `MIN_DURATION_SECONDS` sam tekst.
 - `/tekst` jako odpowiedź na głosówkę: cały tekst.
-- `/usun` jako odpowiedź na wiadomość bota: bot ją kasuje (Telegram pozwala do 48 h).
 - `/id`: pokazuje ID czatu (do `ALLOWED_CHAT_IDS`).
 
 Przepływ: plik z Telegrama → transkrypcja (Groq Whisper `whisper-large-v3-turbo`) → streszczenie (DeepSeek) → odpowiedź w grupie.

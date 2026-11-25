@@ -4,8 +4,7 @@ Bot reaguje tylko na komendy (najlepiej z privacy mode włączonym w @BotFather,
 wtedy Telegram w ogóle nie wysyła mu zwykłych wiadomości z grupy):
 - /skracaj (odpowiedź na głosówkę): streszczenie, a dla głosówki krótszej niż
   MIN_DURATION_SECONDS sam tekst,
-- /tekst (odpowiedź na głosówkę): pełna transkrypcja,
-- /usun (odpowiedź na wiadomość bota): bot usuwa tę swoją wiadomość.
+- /tekst (odpowiedź na głosówkę): pełna transkrypcja.
 Przepływ: pobranie pliku -> transkrypcja (Groq Whisper)
 -> streszczenie (DeepSeek) -> odpowiedź w grupie.
 """
@@ -230,39 +229,13 @@ async def tekst(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await reply_long(target, f"🎙️ {sender}:\n\n{transcript}")
 
 
-async def usun(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """/usun jako odpowiedź na wiadomość bota -> bot ją usuwa (tylko swoje wiadomości)."""
-    message = update.effective_message
-    if not is_allowed(message.chat_id):
-        return
-    target = message.reply_to_message
-    if target is None:
-        await message.reply_text("odpowiedz na moją wiadomość i wpisz /usun 👆")
-        return
-    if not target.from_user or target.from_user.id != context.bot.id:
-        await message.reply_text("mogę kasować tylko swoje 🙅")
-        return
-    try:
-        await target.delete()
-    except Exception as e:
-        log.error("Nie udało się usunąć wiadomości: %s", type(e).__name__)
-        await message.reply_text("nie mogę, telegram pozwala kasować tylko do 48h")
-        return
-    log.info("/usun")
-    try:
-        await message.delete()  # samą komendę też, jeśli bot jest adminem; jeśli nie, zostaje
-    except Exception:
-        pass
-
-
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_allowed(update.effective_chat.id):
         return
     await update.effective_message.reply_text(
         "siema 👋 odpowiedz na głosówkę jedną z komend:\n"
         "/skracaj na głosówce: streszczenie\n"
-        "/tekst na głosówce: cały tekst\n"
-        "/usun na mojej wiadomości: kasuję ją"
+        "/tekst na głosówce: cały tekst"
     )
 
 
@@ -287,7 +260,6 @@ async def post_init(app: Application) -> None:
     await app.bot.set_my_commands([
         BotCommand("skracaj", "streszczenie głosówki (odpowiedz na nią)"),
         BotCommand("tekst", "cały tekst głosówki (odpowiedz na nią)"),
-        BotCommand("usun", "kasuję swoją wiadomość (odpowiedz na nią)"),
         BotCommand("id", "id tego czatu"),
     ])
 
@@ -302,7 +274,6 @@ def main() -> None:
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("skracaj", skracaj))
     app.add_handler(CommandHandler("tekst", tekst))
-    app.add_handler(CommandHandler("usun", usun))
     app.add_handler(CommandHandler("id", show_id))
     app.add_handler(ChatMemberHandler(on_added, ChatMemberHandler.MY_CHAT_MEMBER))
     app.add_error_handler(on_error)
